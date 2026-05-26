@@ -23,6 +23,7 @@ def safe_path(relative_path: str) -> Path:
     return candidate
 
 
+
 class FilePlanAction(BaseModel):
     operation: Literal["move", "rename", "keep"] = Field(
         description="The proposed operation. This phase only plans; it never executes."
@@ -38,6 +39,17 @@ class OrganizationPlan(BaseModel):
     actions: list[FilePlanAction] = Field(description="Proposed file organization actions.")
     assumptions: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
+
+def planned_parent_dirs(actions: list[FilePlanAction]) -> list[str]:
+    dirs = set()
+
+    for action in actions:
+        if action.operation in ("move", "rename"):
+            destination = safe_path(action.destination_path)
+            if destination.parent != ROOT and not destination.parent.exists():
+                dirs.add(str(destination.parent.relative_to(ROOT)))
+
+    return sorted(dirs)
 
 @tool
 def list_files(relative_dir: str = ".", max_results: int = 50) -> str:
@@ -135,17 +147,115 @@ def propose_organization_plan(
 
     return json.dumps(plan, indent=2)
 
-tools = [list_files, inspect_file, propose_organization_plan]
 
-SYSTEM_PROMPT = f"""
-Your goal is to propose a better organization, not merely categorize files in place.
+
+@tool(args_schema=OrganizationPlan)
+def dry_run_organizational_plan(
+    summary: str,
+    actions: List[FilePlanAction],
+    assumptions: List[str] | None = None,
+    risks: List[str] | None = None
+):
+    """Validate a proposed organization plan and return a dry-run report. This does not modify files."""
+    blockers = []
+    warnings = []
+    dry_run_steps = []
+    seen_destinations = {}
+
+    for index, action in enumerate(actions):
+        try:
+            source = safe_path(action.source_path)
+            destination = safe_path(action.destination_path)
+        except Exception as exc:
+            blockers.append(f"Action {index}: unsafe path: {exc}")
+            continue
+
+        destination_key = str(destination).lower()
+        if destination_key in seen_destinations:
+            blockers.append(
+                f"Action {index}: duplicate destination also used by action "
+                f"{seen_destinations[destination_key]}: {action.destination_path}"
+            )
+        else:
+            seen_destinations[destination_key] = index
+        
+        if not source.exists():
+            blockers.append(f"Action {index}: source does not exist: {action.source_path}")
+            continue
+
+        if not source.is_file():
+            blockers.append(f"Action {index}: source is not a file: {action.source_path}")
+            continue
+
+        if action.operation == "keep":
+            if source != destination:
+                blockers.append(
+                    f"Action {index}: keep requires identical source and destination"
+                )
+            else:
+                dry_run_steps.append(f"KEEP {action.source_path}")
+        
+        if action.operation in ("rename", "move"):
+            if source == destination:
+                blockers.append(
+                    f"Action {index}: {action.operation} destination equals source"
+                )
+                continue
+            
+            if destination.exists():
+                blockers.append(
+                    f"Action {index}: destination already exists: {action.destination_path}"
+                )
+                continue
+            
+            if destination.parent.exists() and not destination.parent.is_dir():
+                blockers.append(
+                    f"Action {index}: destination parent is not a directory: "
+                    f"{destination.parent.relative_to(ROOT)}"
+                )
+                continue
+
+            if destination.parent.exists():
+                for sibling in destination.parent.iterdir():
+                    if sibling.name.lower() == destination.name.lower():
+                        blockers.append(
+                            f"Action {index}: case-insensitive name collision with: "
+                            f"{sibling.relative_to(ROOT)}"
+                        )
+                        break
+            
+            verb = "MOVE" if action.operation == "move" else "RENAME"
+            dry_run_steps.append(
+                f"{verb} {action.source_path} -> {action.destination_path}"
+            )
+    create_dirs = planned_parent_dirs(actions)
+    report = {
+        "phase": "dry_run_only",
+        "changes_applied": False,
+        "ready_for_approval": len(blockers) == 0,
+        "overwrite_policy": "never_overwrite_existing_files",
+        "summary": summary,
+        "create_directories": create_dirs,
+        "steps": dry_run_steps,
+        "blockers": blockers,
+        "warnings": warnings,
+        "assumptions": assumptions or [],
+        "risks": risks or []
+    }
+    return json.dumps(report, indent=2)
+
+
+tools = [list_files, inspect_file, propose_organization_plan, dry_run_organizational_plan]
+
+SYSTEM_PROMPT = SYSTEM_PROMPT = f"""
+Your goal is to propose a better organization, validate it with a dry run, and explain the result.
 Do not use hidden reasoning or thinking mode. Respond directly with either a tool call or a concise final answer.
-
 
 You can inspect files only inside this root:
 {ROOT}
 
-Current phase: structured planning only.
+Current phase: dry-run validation only.
+
 If a file is currently at the root and belongs in a category folder, propose operation="move" with a destination_path like:
 - Documents/resume.pdf
 - Images/vacation.jpg
@@ -154,17 +264,32 @@ If a file is currently at the root and belongs in a category folder, propose ope
 Rules:
 - You may list files and inspect file metadata.
 - You must propose organization using the propose_organization_plan tool.
+- After proposing the plan, you must call dry_run_organization_plan with the same actions.
 - You must not move, rename, delete, create, or modify files.
 - Every proposed source_path and destination_path must be relative to the organizer root.
 - Prefer simple destination folders like Documents/, Images/, Notes/, Archives/, Code/, Misc/.
 - Use operation="keep" only when the file is already in the right destination folder and source_path equals destination_path.
-- If destination_path is different from source_path, use operation="move" or "rename".- If uncertain, include the uncertainty in assumptions or risks.
-- After the plan tool returns, summarize the plan clearly for the user.
-
+- If destination_path is different from source_path, use operation="move" or "rename".
+- Destination folders do not need to exist yet. The dry-run may report which folders would be created later.
+- Do not mark missing category folders as blockers unless there is a path conflict, permission issue, or unsafe path.
+- If uncertain, include the uncertainty in assumptions or risks.
+- The dry-run tool is the source of truth for whether a plan is safe.
+- If dry-run returns blockers, explain them and do not say the plan is ready.
+- If dry-run returns ready_for_approval=true, summarize the dry-run steps and say clearly that no changes were applied.
+- Do not invent risks that contradict the dry-run result.
+- If dry_run_organization_plan reports no blockers and ready_for_approval=true, do not warn about overwrites unless the dry-run report explicitly says there is an overwrite or destination collision.
+- The executor must never overwrite existing files.
 Examples:
 - keep: source_path="notes.txt", destination_path="notes.txt"
 - move: source_path="notes.txt", destination_path="Notes/notes.txt"
 - rename: source_path="tax_2024.pdf", destination_path="tax-return-2024.pdf"
+
+Expected workflow:
+1. Use list_files to inspect the organizer root.
+2. Use inspect_file if metadata is needed for specific files.
+3. Use propose_organization_plan to submit the structured plan.
+4. Use dry_run_organization_plan to validate that same plan.
+5. Summarize the dry-run result for the user.
 """
 
 config = {
